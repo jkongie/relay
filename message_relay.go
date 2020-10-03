@@ -5,64 +5,49 @@ import (
 	"sync"
 )
 
-type MessageType int
-
-const (
-	StartNewRound MessageType = 1 << iota
-	ReceivedAnswer
-)
-
-type NetworkSocket interface {
-	Read() (Message, error)
-}
-
-// Message represents a message received from the network
-type Message struct {
-	Type MessageType
-	Data []byte
-}
-
-// NewMessage constructs a new message
-func NewMessage(t MessageType, data string) Message {
-	return Message{
-		Type: t,
-		Data: []byte(data),
-	}
-}
-
+// MessageRelayer defines a message relay which publishes messages to
+// subscribers.
 type MessageRelayer interface {
 	SubscribeToMessages(msgType MessageType, messages chan<- Message)
 	Start()
 	Stop()
 }
 
+// NewMessageRelayer contructs a relayer
 func NewMessageRelayer(socket NetworkSocket) *relayer {
 	r := &relayer{
 		socket:        socket,
 		subscriptions: []Subscription{},
 		queue:         NewQueue(),
-		readDone:      make(chan bool),
-		broadcastDone: make(chan bool),
+		chMsgReceived: make(chan struct{}),
 	}
 
 	return r
 }
 
+// Subscription defines the MessageType to received and the channel on which to
+// receive the message.
 type Subscription struct {
 	MsgType    MessageType
 	MsgChannel chan<- Message
 }
 
-//
+// relayer implements MesssageRelay
 type relayer struct {
+	mux           sync.Mutex
 	socket        NetworkSocket
 	subscriptions []Subscription
+	chMsgReceived chan struct{}
+	chStop        chan struct{}
 	queue         *Queue
-	readDone      chan bool
-	broadcastDone chan bool
+
+	verbose bool
 }
 
 func (r *relayer) SubscribeToMessages(msgType MessageType, messages chan<- Message) {
+	r.mux.Lock()
+	defer r.mux.Unlock()
+
 	r.subscriptions = append(r.subscriptions, Subscription{
 		MsgType:    msgType,
 		MsgChannel: messages,
@@ -70,25 +55,27 @@ func (r *relayer) SubscribeToMessages(msgType MessageType, messages chan<- Messa
 }
 
 func (r *relayer) Start() {
+	r.chStop = make(chan struct{})
+
 	var wg sync.WaitGroup
 
 	wg.Add(1)
 	go r.read(&wg)
+
 	wg.Add(1)
 	go r.broadcast(&wg)
 
 	wg.Wait()
 }
 
-func (r *relayer) Shutdown() {
-	r.readDone <- true
-	r.broadcastDone <- true
+func (r *relayer) Stop() {
+	close(r.chStop)
 }
 
 func (r *relayer) read(wg *sync.WaitGroup) {
 	for {
 		select {
-		case <-r.readDone:
+		case <-r.chStop:
 			wg.Done()
 
 			return
@@ -103,43 +90,48 @@ func (r *relayer) read(wg *sync.WaitGroup) {
 
 			// Enqueue the message
 			r.queue.Enqueue(msg)
+			if r.verbose {
+				fmt.Printf("[Queued] Type=%d Data=%s\n", msg.Type, string(msg.Data))
+			}
+			r.chMsgReceived <- struct{}{}
 		}
 	}
 }
 
 func (r *relayer) broadcast(wg *sync.WaitGroup) {
-	shutdown := false
-
 	for {
 		select {
-		case shutdown = <-r.broadcastDone:
-		default:
-			if len(r.subscriptions) > 0 {
-				msg := r.queue.Dequeue()
+		case <-r.chStop:
+			wg.Done()
 
-				if msg != nil {
+			return
+		case <-r.chMsgReceived:
+			msg := r.queue.Dequeue()
+
+			if msg != nil {
+				if r.verbose {
 					fmt.Printf("[Broadcasting] Type=%d Data=%s\n", msg.Type, string(msg.Data))
+				}
 
-					for _, s := range r.subscriptions {
-						// Check the subscriber wants to received the message type
-						if s.MsgType == 0 || s.MsgType == msg.Type {
-							// Send the message to the subscriber. Skip the broadcast if the
-							// channel is blocked
-							select {
-							case s.MsgChannel <- *msg:
-							default:
-								fmt.Println("no message sent", string(msg.Data))
+				for _, s := range r.subscriptions {
+					// Check the subscriber wants to received the message type
+					if s.MsgType == 0 || s.MsgType == msg.Type {
+						// Send the message to the subscriber. Skip the broadcast if the
+						// channel is blocked
+						select {
+						case s.MsgChannel <- *msg:
+						default:
+							if r.verbose {
+								fmt.Println("Subscriber busy - Skipping", string(msg.Data))
 							}
 						}
-					}
-				} else {
-					if shutdown {
-						wg.Done()
-
-						return
 					}
 				}
 			}
 		}
 	}
+}
+
+func (r *relayer) SetVerbose(verbose bool) {
+	r.verbose = verbose
 }

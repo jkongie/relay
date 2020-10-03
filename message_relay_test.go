@@ -2,6 +2,7 @@ package relay
 
 import (
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -18,30 +19,138 @@ func (skt *MockNetworkSocket) Read() (Message, error) {
 	return args.Get(0).(Message), args.Error(1)
 }
 
+// MockSubscriber mocks a subscriber and decrements a wait group counter when
+// the expected number of Process calls have been made.
 type MockSubscriber struct {
 	mock.Mock
+	mux       sync.Mutex
+	callCount int
+	doneCount int
+	wg        *sync.WaitGroup
 }
 
+func NewMockSubscriber(doneCount int, wg *sync.WaitGroup) *MockSubscriber {
+	return &MockSubscriber{
+		callCount: 0,
+		doneCount: doneCount,
+		wg:        wg,
+	}
+}
+
+// Process mocks a subscriber Process call and decrements a WaitGroup counter
 func (ms *MockSubscriber) Process(msg Message) error {
+	ms.mux.Lock()
+	defer ms.mux.Unlock()
+
 	ms.Called(msg)
+
+	ms.callCount++
+	if ms.callCount == ms.doneCount {
+		ms.wg.Done()
+	}
 
 	return nil
 }
 
-func TestSimpleAlternatingMessages(t *testing.T) {
+func TestSimpleStartNewRoundQueue(t *testing.T) {
+	var wg sync.WaitGroup
+
 	mockSocket := new(MockNetworkSocket)
 
-	for i := 0; i <= 1; i++ {
-		mockSocket.On("Read").Return(NewMessage(MessageType(i%2+1), "data"), nil).After(500 * time.Millisecond).Once()
+	mockSocket.On("Read").Return(NewMessage(StartNewRound, "1"), nil).After(500 * time.Millisecond).Once()
+	mockSocket.On("Read").Return(NewMessage(StartNewRound, "2"), nil).After(500 * time.Millisecond).Once()
+	mockSocket.On("Read").Return(Message{}, errors.New("No more data"))
+
+	mockSubscriber1 := NewMockSubscriber(2, &wg)
+	wg.Add(1)
+	mockSubscriber1.On("Process", NewMessage(StartNewRound, "1"))
+	mockSubscriber1.On("Process", NewMessage(StartNewRound, "2"))
+
+	relayer := NewMessageRelayer(mockSocket)
+
+	ch1 := make(chan Message)
+
+	go func() {
+		for {
+			msg := <-ch1
+
+			mockSubscriber1.Process(msg)
+		}
+	}()
+
+	// Subscriber1 reads all messages
+	relayer.SubscribeToMessages(0, ch1)
+
+	go relayer.Start()
+
+	wg.Wait()
+
+	relayer.Stop()
+
+	mockSubscriber1.AssertNumberOfCalls(t, "Process", 2)
+}
+
+func TestSimpleReceivedAnswerQueue(t *testing.T) {
+	var wg sync.WaitGroup
+
+	mockSocket := new(MockNetworkSocket)
+
+	mockSocket.On("Read").Return(NewMessage(ReceivedAnswer, "1"), nil).After(50 * time.Millisecond).Once()
+	mockSocket.On("Read").Return(NewMessage(ReceivedAnswer, "2"), nil).After(50 * time.Millisecond).Once()
+	mockSocket.On("Read").Return(Message{}, errors.New("No more data"))
+
+	mockSubscriber1 := NewMockSubscriber(2, &wg)
+	wg.Add(1)
+
+	mockSubscriber1.On("Process", NewMessage(ReceivedAnswer, "1"))
+	mockSubscriber1.On("Process", NewMessage(ReceivedAnswer, "2"))
+
+	relayer := NewMessageRelayer(mockSocket)
+
+	ch1 := make(chan Message)
+
+	go func() {
+		for {
+			msg := <-ch1
+
+			mockSubscriber1.Process(msg)
+		}
+	}()
+
+	// Subscriber1 reads all messages
+	relayer.SubscribeToMessages(0, ch1)
+
+	go relayer.Start()
+
+	wg.Wait()
+
+	relayer.Stop()
+
+	mockSubscriber1.AssertNumberOfCalls(t, "Process", 2)
+}
+
+func TestSimpleAlternatingMessages(t *testing.T) {
+	var wg sync.WaitGroup
+	mockSocket := new(MockNetworkSocket)
+
+	for i := 0; i <= 3; i++ {
+		mockSocket.On("Read").
+			Return(NewMessage(MessageType(i%2+1), "data"), nil).
+			After(50 * time.Millisecond).
+			Once()
 	}
 	mockSocket.On("Read").Return(Message{}, errors.New("No more data"))
 
-	mockSubscriber1 := new(MockSubscriber)
-	mockSubscriber1.On("Process", mock.AnythingOfType("Message"))
-	mockSubscriber2 := new(MockSubscriber)
-	mockSubscriber2.On("Process", mock.AnythingOfType("Message"))
-	mockSubscriber3 := new(MockSubscriber)
-	mockSubscriber3.On("Process", mock.AnythingOfType("Message"))
+	mockSubscriber1 := NewMockSubscriber(4, &wg)
+	wg.Add(1)
+	mockSubscriber1.On("Process", NewMessage(StartNewRound, "data")).Times(2)
+	mockSubscriber1.On("Process", NewMessage(ReceivedAnswer, "data")).Times(2)
+	mockSubscriber2 := NewMockSubscriber(2, &wg)
+	wg.Add(1)
+	mockSubscriber2.On("Process", NewMessage(StartNewRound, "data")).Times(2)
+	mockSubscriber3 := NewMockSubscriber(2, &wg)
+	wg.Add(1)
+	mockSubscriber3.On("Process", NewMessage(ReceivedAnswer, "data")).Times(2)
 
 	relayer := NewMessageRelayer(mockSocket)
 
@@ -82,25 +191,27 @@ func TestSimpleAlternatingMessages(t *testing.T) {
 
 	go relayer.Start()
 
-	// Sleeping here to give time for the test to run. Not sure how else to handle this.
-	time.Sleep(2 * time.Second)
+	wg.Wait()
 
-	relayer.Shutdown()
+	relayer.Stop()
 
-	mockSubscriber1.AssertNumberOfCalls(t, "Process", 2)
-	mockSubscriber2.AssertNumberOfCalls(t, "Process", 1)
-	mockSubscriber3.AssertNumberOfCalls(t, "Process", 1)
+	mockSubscriber1.AssertNumberOfCalls(t, "Process", 4)
+	mockSubscriber2.AssertNumberOfCalls(t, "Process", 2)
+	mockSubscriber3.AssertNumberOfCalls(t, "Process", 2)
 }
 
 func TestBusySubscriber(t *testing.T) {
+	var wg sync.WaitGroup
 	mockSocket := new(MockNetworkSocket)
 
-	mockSocket.On("Read").Return(NewMessage(StartNewRound, "1"), nil).After(500 * time.Millisecond).Once()
-	mockSocket.On("Read").Return(NewMessage(StartNewRound, "2"), nil).Once()
-	mockSocket.On("Read").Return(NewMessage(StartNewRound, "3"), nil).After(600 * time.Millisecond).Once()
+	mockSocket.On("Read").Return(NewMessage(StartNewRound, "1"), nil).Once()
+	// Skip this message. The read time is set to be during the processing time of the subscriber
+	mockSocket.On("Read").Return(NewMessage(StartNewRound, "2"), nil).After(25 * time.Millisecond).Once()
+	mockSocket.On("Read").Return(NewMessage(StartNewRound, "3"), nil).After(75 * time.Millisecond).Once()
 	mockSocket.On("Read").Return(Message{}, errors.New("No more data"))
 
-	mockSubscriber1 := new(MockSubscriber)
+	mockSubscriber1 := NewMockSubscriber(2, &wg)
+	wg.Add(1)
 	mockSubscriber1.On("Process", NewMessage(StartNewRound, "1"))
 	mockSubscriber1.On("Process", NewMessage(StartNewRound, "3"))
 
@@ -112,7 +223,7 @@ func TestBusySubscriber(t *testing.T) {
 		for {
 			msg := <-ch1
 
-			time.Sleep(1000)
+			time.Sleep(50 * time.Millisecond)
 
 			mockSubscriber1.Process(msg)
 		}
@@ -123,136 +234,20 @@ func TestBusySubscriber(t *testing.T) {
 
 	go relayer.Start()
 
-	// Sleeping here to give time for the test to run. Not sure how else to handle this.
-	time.Sleep(2 * time.Second)
+	wg.Wait()
 
-	relayer.Shutdown()
+	relayer.Stop()
 
 	mockSubscriber1.AssertNumberOfCalls(t, "Process", 2)
 }
 
+// These would only test the priority handling of the queue, which is tested in
+// the queue tests itself.
 // func TestStartNewRoundBroadcastFirst(t *testing.T) {
-// 	fmt.Println("TestStartNewRoundBroadcastFirst")
-// 	mockSocket := new(MockNetworkSocket)
-
-// 	mockSocket.On("Read").Return(NewMessage(StartNewRound, "snr1"), nil).Once()
-// 	mockSocket.On("Read").Return(NewMessage(ReceivedAnswer, "ra1"), nil).Once()
-// 	mockSocket.On("Read").Return(NewMessage(StartNewRound, "snr2"), nil).Once()
-// 	mockSocket.On("Read").Return(Message{}, errors.New("No more data"))
-
-// 	mockSubscriber1 := new(MockSubscriber)
-// 	mockSubscriber1.On("Process", NewMessage(StartNewRound, "snr1"))
-// 	mockSubscriber1.On("Process", NewMessage(StartNewRound, "snr2"))
-// 	mockSubscriber1.On("Process", NewMessage(ReceivedAnswer, "ra1"))
-
-// 	relayer := NewMessageRelayer(mockSocket)
-
-// 	ch1 := make(chan Message)
-
-// 	go func() {
-// 		for {
-// 			msg := <-ch1
-// 			fmt.Printf("\t[Subscriber 1] Processed Type=%d Data=%s\n", msg.Type, string(msg.Data))
-
-// 			// time.Sleep(1000)
-
-// 			mockSubscriber1.Process(msg)
-// 		}
-// 	}()
-
-// 	// Subscriber1 reads all messages
-// 	relayer.SubscribeToMessages(0, ch1)
-
-// 	go relayer.Start()
-
-// 	// Sleeping here to give time for the test to run. Not sure how else to handle this.
-// 	time.Sleep(3 * time.Second)
-
-// 	relayer.Shutdown()
-
-// 	mockSubscriber1.AssertNumberOfCalls(t, "Process", 3)
 // }
 
 // func TestMostRecentReceivedAnswer(t *testing.T) {
-// 	mockSocket := new(MockNetworkSocket)
-
-// 	mockSocket.On("Read").Return(NewMessage(ReceivedAnswer, "1"), nil).Once()
-// 	mockSocket.On("Read").Return(NewMessage(ReceivedAnswer, "2"), nil).Once()
-// 	mockSocket.On("Read").Return(NewMessage(ReceivedAnswer, "3"), nil).Once()
-
-// 	mockSocket.On("Read").Return(Message{}, errors.New("No more data"))
-
-// 	mockSubscriber1 := new(MockSubscriber)
-// 	mockSubscriber1.On("Process", NewMessage(ReceivedAnswer, "1"))
-// 	mockSubscriber1.On("Process", NewMessage(ReceivedAnswer, "3"))
-
-// 	relayer := NewMessageRelayer(mockSocket)
-
-// 	ch1 := make(chan Message)
-
-// 	go func() {
-// 		for {
-// 			msg := <-ch1
-// 			fmt.Printf("\t[Subscriber 1] Processed Type=%d Data=%s\n", msg.Type, string(msg.Data))
-
-// 			// time.Sleep(1000)
-
-// 			mockSubscriber1.Process(msg)
-// 		}
-// 	}()
-
-// 	// Subscriber1 reads all messages
-// 	relayer.SubscribeToMessages(0, ch1)
-
-// 	go relayer.Start()
-
-// 	// Sleeping here to give time for the test to run. Not sure how else to handle this.
-// 	time.Sleep(3 * time.Second)
-
-// 	relayer.Shutdown()
-
-// 	mockSubscriber1.AssertNumberOfCalls(t, "Process", 2)
 // }
 
 // func TestMostRecentStartNewRounds(t *testing.T) {
-// 	mockSocket := new(MockNetworkSocket)
-
-// 	mockSocket.On("Read").Return(NewMessage(StartNewRound, "1"), nil).Once()
-// 	mockSocket.On("Read").Return(NewMessage(StartNewRound, "2"), nil).Once()
-// 	mockSocket.On("Read").Return(NewMessage(StartNewRound, "3"), nil).Once()
-// 	mockSocket.On("Read").Return(NewMessage(StartNewRound, "4"), nil).Once()
-
-// 	mockSocket.On("Read").Return(Message{}, errors.New("No more data"))
-
-// 	mockSubscriber1 := new(MockSubscriber)
-// 	mockSubscriber1.On("Process", NewMessage(StartNewRound, "1"))
-// 	mockSubscriber1.On("Process", NewMessage(StartNewRound, "3"))
-// 	mockSubscriber1.On("Process", NewMessage(StartNewRound, "4"))
-
-// 	relayer := NewMessageRelayer(mockSocket)
-
-// 	ch1 := make(chan Message)
-
-// 	go func() {
-// 		for {
-// 			msg := <-ch1
-// 			fmt.Printf("\t[Subscriber 1] Processed Type=%d Data=%s\n", msg.Type, string(msg.Data))
-
-// 			// time.Sleep(1000)
-
-// 			mockSubscriber1.Process(msg)
-// 		}
-// 	}()
-
-// 	// Subscriber1 reads all messages
-// 	relayer.SubscribeToMessages(0, ch1)
-
-// 	go relayer.Start()
-
-// 	// Sleeping here to give time for the test to run. Not sure how else to handle this.
-// 	time.Sleep(3 * time.Second)
-
-// 	relayer.Shutdown()
-
-// 	mockSubscriber1.AssertNumberOfCalls(t, "Process", 3)
 // }
