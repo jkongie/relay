@@ -4,20 +4,32 @@ import (
 	"sync"
 )
 
+// StartNewRoundQueueLimit defines the number of messages that can be queued for
+// the StartNewRound message type
+const StartNewRoundQueueLimit = 2
+
+// ReceivedAnswerQueueLimit defines the number of messages that can be queued for
+// the ReceivedAnswer message type
+const ReceivedAnswerQueueLimit = 1
+
 // Queue stores the messages that have been read in by the relay. It takes a
 // unique queue implemntation because we must ensure that the most recent
 // StartNewRound and ReceivedAnswer messages are delivered. As such,
 // ReceivedAnswer messages are stored separately from the StartNewRound messages
 // queue.
 type Queue struct {
-	mux      sync.Mutex
-	messages []Message
+	mux sync.Mutex
+	// Contains the StartNewRound messages
+	startMessages []Message
+	// Contains the ReceivedAnswer messages
+	receivedMessages []Message
 }
 
 // NewQueue constructs a new empty queue
 func NewQueue() *Queue {
 	return &Queue{
-		messages: []Message{},
+		startMessages:    []Message{},
+		receivedMessages: []Message{},
 	}
 }
 
@@ -28,35 +40,21 @@ func (q *Queue) Enqueue(msg Message) {
 
 	switch msg.Type {
 	case StartNewRound:
-		count := 0
-		for _, msg := range q.messages {
-			if msg.Type == StartNewRound {
-				count++
-			}
+		// Remove the oldest message
+		if len(q.startMessages) >= StartNewRoundQueueLimit {
+			q.startMessages = q.startMessages[1:]
 		}
 
-		// Delete the oldest StartNewRound message when the limit is reached
-		if len(q.messages) > 0 && count >= 2 {
-			idx := 0
-			if q.messages[0].Type == ReceivedAnswer {
-				idx = 1
-			}
-
-			q.messages = append(q.messages[:idx], q.messages[idx+1:]...)
-		}
-
-		// Append the message
-		q.messages = append(q.messages, msg)
+		// Append the latest message
+		q.startMessages = append(q.startMessages, msg)
 	case ReceivedAnswer:
-		// Replace the most recent received answer otherwise unshift it into
-		// the queue. We know that the ReceivedAnswer message is always the
-		// first item in the slice because we unshift any addition of that type
-		// of message
-		if len(q.messages) > 0 && q.messages[0].Type == ReceivedAnswer {
-			q.messages[0] = msg
-		} else {
-			q.messages = append([]Message{msg}, q.messages...)
+		// Remove the oldest message
+		if len(q.receivedMessages) >= ReceivedAnswerQueueLimit {
+			q.receivedMessages = q.receivedMessages[1:]
 		}
+
+		// Append the latest message
+		q.receivedMessages = append(q.receivedMessages, msg)
 	}
 }
 
@@ -66,17 +64,22 @@ func (q *Queue) Dequeue() *Message {
 	q.mux.Lock()
 	defer q.mux.Unlock()
 
-	if len(q.messages) > 0 {
-		msg := q.messages[len(q.messages)-1]
-		q.messages = q.messages[:len(q.messages)-1]
+	// Prioritise any StartNewRound messages in the queue
+	if len(q.startMessages) > 0 {
+		// Pop the msg
+		msg := q.startMessages[len(q.startMessages)-1]
+		q.startMessages = q.startMessages[:len(q.startMessages)-1]
+
+		return &msg
+	}
+
+	if len(q.receivedMessages) > 0 {
+		// Pop the msg
+		msg := q.receivedMessages[len(q.receivedMessages)-1]
+		q.receivedMessages = q.receivedMessages[:len(q.receivedMessages)-1]
 
 		return &msg
 	}
 
 	return nil
-}
-
-// GetMessages is an accessor to messages
-func (q *Queue) GetMessages() []Message {
-	return q.messages
 }
